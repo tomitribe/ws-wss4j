@@ -25,10 +25,12 @@ import java.util.List;
 import javax.xml.namespace.QName;
 
 import org.apache.wss4j.common.ext.WSSecurityException;
+import org.apache.wss4j.common.WSSPolicyException;
 import org.apache.wss4j.policy.stax.PolicyViolationException;
 import org.apache.wss4j.policy.stax.enforcer.PolicyEnforcer;
 import org.apache.wss4j.stax.ext.WSSConstants;
 import org.apache.wss4j.stax.securityEvent.OperationSecurityEvent;
+import org.apache.wss4j.stax.utils.WSSUtils;
 import org.apache.xml.security.stax.ext.XMLSecurityConstants;
 import org.apache.xml.security.stax.securityEvent.SignedElementSecurityEvent;
 import org.junit.Assert;
@@ -98,6 +100,55 @@ public class SignedElementsTest extends AbstractPolicyTestBase {
             Assert.assertEquals(e.getCause().getMessage(),
                     "Element /{http://example.org}a must be signed");
             Assert.assertEquals(e.getFaultCode(), WSSecurityException.INVALID_SECURITY);
+        }
+    }
+
+    @Test
+    public void testRelativeXPathMustBeSigned() throws Exception {
+        String policyString =
+                "<sp:SignedElements xmlns:sp=\"http://docs.oasis-open.org/ws-sx/ws-securitypolicy/200702\">\n" +
+                        "<sp:XPath xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\">wsu:Created</sp:XPath>\n" +
+                        "</sp:SignedElements>";
+        PolicyEnforcer policyEnforcer = buildAndStartPolicyEngine(policyString);
+
+        OperationSecurityEvent operationSecurityEvent = new OperationSecurityEvent();
+        operationSecurityEvent.setOperation(new QName("definitions"));
+        policyEnforcer.registerSecurityEvent(operationSecurityEvent);
+
+        List<QName> createdPath = new ArrayList<>();
+        createdPath.addAll(WSSConstants.WSSE_SECURITY_HEADER_PATH);
+        createdPath.add(WSSConstants.TAG_WSU_TIMESTAMP);
+        createdPath.add(WSSConstants.TAG_WSU_CREATED);
+        SignedElementSecurityEvent signedElementSecurityEvent = new SignedElementSecurityEvent(null, false, null);
+        signedElementSecurityEvent.setElementPath(createdPath);
+
+        try {
+            policyEnforcer.registerSecurityEvent(signedElementSecurityEvent);
+            Assert.fail("Exception expected");
+        } catch (WSSecurityException e) {
+            Assert.assertTrue(e.getCause() instanceof PolicyViolationException);
+            Assert.assertEquals(e.getCause().getMessage(),
+                    "Element " + WSSUtils.pathAsString(createdPath) + " must be signed");
+            Assert.assertEquals(e.getFaultCode(), WSSecurityException.INVALID_SECURITY);
+        }
+    }
+
+    @Test
+    public void testUnsupportedXPathIsRejected() throws Exception {
+        String policyString =
+                "<sp:SignedElements xmlns:sp=\"http://docs.oasis-open.org/ws-sx/ws-securitypolicy/200702\">\n" +
+                        "<sp:XPath xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\">//wsu:Created</sp:XPath>\n" +
+                        "</sp:SignedElements>";
+
+        PolicyEnforcer policyEnforcer = buildAndStartPolicyEngine(policyString);
+        OperationSecurityEvent operationSecurityEvent = new OperationSecurityEvent();
+        operationSecurityEvent.setOperation(new QName("definitions"));
+
+        try {
+            policyEnforcer.registerSecurityEvent(operationSecurityEvent);
+            Assert.fail("Exception expected");
+        } catch (WSSecurityException e) {
+            Assert.assertTrue(e.getCause() instanceof WSSPolicyException);
         }
     }
 }

@@ -138,10 +138,21 @@ public class UsernameTokenProcessor implements Processor {
         UsernameToken ut =
             new UsernameToken(token, allowNamespaceQualifiedPasswordTypes, data.getBSPEnforcer());
 
-        // Test for replay attacks
+        // Test for replay attacks. Key the cache on the canonical form of the Nonce (CVE-2026-92899):
+        // the digest is computed over the decoded bytes, so equivalent encodings must collide.
         ReplayCache replayCache = data.getNonceReplayCache();
+        String nonceIdentifier = null;
+        long nonceTTL = -1L;
         if (replayCache != null && ut.getNonce() != null) {
-            if (replayCache.contains(ut.getNonce())) {
+            try {
+                nonceIdentifier = org.apache.xml.security.utils.Base64.encode(
+                    org.apache.xml.security.utils.Base64.decode(ut.getNonce()));
+            } catch (org.apache.xml.security.exceptions.Base64DecodingException ex) {
+                throw new WSSecurityException(
+                    WSSecurityException.ErrorCode.INVALID_SECURITY, ex, "badUsernameToken",
+                    new Object[] {"The Nonce is not valid Base-64"});
+            }
+            if (replayCache.contains(nonceIdentifier)) {
                 throw new WSSecurityException(
                     WSSecurityException.ErrorCode.INVALID_SECURITY,
                     "badUsernameToken",
@@ -153,10 +164,8 @@ public class UsernameTokenProcessor implements Processor {
             // Otherwise, cache for the configured TTL of the UsernameToken Created time, as any
             // older token will just get rejected anyway
             Date created = ut.getCreatedDate();
-            if (created == null || utTTL <= 0) {
-                replayCache.add(ut.getNonce());
-            } else {
-                replayCache.add(ut.getNonce(), utTTL + 1L);
+            if (created != null && utTTL > 0) {
+                nonceTTL = utTTL + 1L;
             }
         }
 
@@ -168,7 +177,16 @@ public class UsernameTokenProcessor implements Processor {
         Credential credential = new Credential();
         credential.setUsernametoken(ut);
         if (validator != null) {
-            return validator.validate(credential, data);
+            credential = validator.validate(credential, data);
+        }
+
+        // Only cache the Nonce once the token has been validated (upstream #704).
+        if (nonceIdentifier != null) {
+            if (nonceTTL > 0) {
+                replayCache.add(nonceIdentifier, nonceTTL);
+            } else {
+                replayCache.add(nonceIdentifier);
+            }
         }
         return credential;
     }

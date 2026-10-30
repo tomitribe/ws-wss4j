@@ -29,6 +29,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Properties;
 
+import javax.xml.stream.XMLStreamException;
 import javax.xml.stream.XMLStreamReader;
 import javax.xml.stream.XMLStreamWriter;
 import javax.xml.transform.dom.DOMSource;
@@ -38,6 +39,7 @@ import org.apache.wss4j.common.crypto.Crypto;
 import org.apache.wss4j.common.crypto.CryptoFactory;
 import org.apache.wss4j.common.crypto.CryptoType;
 import org.apache.wss4j.common.derivedKey.ConversationConstants;
+import org.apache.wss4j.common.ext.WSSecurityException;
 import org.apache.wss4j.common.token.SecurityTokenReference;
 import org.apache.wss4j.dom.WSConstants;
 import org.apache.wss4j.dom.engine.WSSConfig;
@@ -1084,5 +1086,108 @@ public class DerivedKeyTokenTest extends AbstractTestBase {
             nodeList = document.getElementsByTagNameNS(WSSConstants.TAG_xenc_EncryptedData.getNamespaceURI(), WSSConstants.TAG_xenc_EncryptedData.getLocalPart());
             Assert.assertEquals(nodeList.getLength(), 0);
         }
+    }
+
+    @Test
+    public void testSignatureInboundMinimumDerivedKeyLength() throws Exception {
+        byte[] message = createDerivedKeySignedMessage(16, null);
+
+        Document document = processDerivedKeySignedMessage(message);
+
+        NodeList nodeList = document.getElementsByTagNameNS(WSSConstants.TAG_dsig_Signature.getNamespaceURI(), WSSConstants.TAG_dsig_Signature.getLocalPart());
+        Assert.assertEquals(nodeList.getLength(), 1);
+    }
+
+    /**
+     * A sender-chosen wsc:Length of 8 bytes would reduce the HMAC key to a brute-forceable size,
+     * so it must be rejected even though the signature itself verifies with the short key.
+     */
+    @Test
+    public void testSignatureInboundDerivedKeyLengthBelowMinimum() throws Exception {
+        byte[] message = createDerivedKeySignedMessage(8, null);
+
+        try {
+            processDerivedKeySignedMessage(message);
+            Assert.fail("Expected failure on a derived key length below the minimum");
+        } catch (XMLStreamException e) {
+            Assert.assertTrue(e.getCause() instanceof WSSecurityException);
+            assertCauseMessageContains(e, "Requested derived key length of 8 byte(s) is less than the minimum allowed");
+        }
+    }
+
+    /**
+     * The message is signed with a 20 byte derived key and its wsc:Length is then rewritten to
+     * 2^32 + 20, which narrows to 20 as an int. It must be rejected rather than wrap around to a
+     * value that passes the bounds and verifies.
+     */
+    @Test
+    public void testSignatureInboundDerivedKeyLengthWrapsAround() throws Exception {
+        byte[] message = createDerivedKeySignedMessage(20, "4294967316");
+
+        try {
+            processDerivedKeySignedMessage(message);
+            Assert.fail("Expected failure on a derived key length that wraps around");
+        } catch (XMLStreamException e) {
+            Assert.assertTrue(e.getCause() instanceof WSSecurityException);
+            assertCauseMessageContains(e, "Requested derived key length of 4294967316 bytes is outside the allowed range");
+        }
+    }
+
+    /**
+     * Sign the SOAP Body with an HMAC-SHA1 key derived from an EncryptedKey, optionally rewriting
+     * the wsc:Length of the DerivedKeyToken afterwards (the DerivedKeyToken itself isn't signed).
+     */
+    private byte[] createDerivedKeySignedMessage(int derivedKeyLength, String lengthOverride) throws Exception {
+        Document doc = SOAPUtil.toSOAPPart(SOAPUtil.SAMPLE_SOAP_MSG);
+        WSSecHeader secHeader = new WSSecHeader(doc);
+        secHeader.insertSecurityHeader();
+
+        WSSecEncryptedKey encrKeyBuilder = new WSSecEncryptedKey();
+        encrKeyBuilder.setUserInfo("receiver");
+        encrKeyBuilder.setKeyIdentifierType(WSConstants.THUMBPRINT_IDENTIFIER);
+        Crypto crypto = CryptoFactory.getInstance("transmitter-crypto.properties");
+        encrKeyBuilder.prepare(doc, crypto);
+
+        WSSecDKSign sigBuilder = new WSSecDKSign();
+        sigBuilder.setWscVersion(version);
+        sigBuilder.setExternalKey(encrKeyBuilder.getEphemeralKey(), encrKeyBuilder.getId());
+        sigBuilder.setSignatureAlgorithm(WSConstants.HMAC_SHA1);
+        sigBuilder.setDerivedKeyLength(derivedKeyLength);
+        sigBuilder.build(doc, secHeader);
+
+        encrKeyBuilder.prependToHeader(secHeader);
+        encrKeyBuilder.prependBSTElementToHeader(secHeader);
+
+        if (lengthOverride != null) {
+            NodeList lengthElements = doc.getElementsByTagNameNS("*", "Length");
+            Assert.assertEquals(1, lengthElements.getLength());
+            lengthElements.item(0).setTextContent(lengthOverride);
+        }
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        javax.xml.transform.Transformer transformer = TRANSFORMER_FACTORY.newTransformer();
+        transformer.transform(new DOMSource(doc), new StreamResult(baos));
+        return baos.toByteArray();
+    }
+
+    private Document processDerivedKeySignedMessage(byte[] message) throws Exception {
+        WSSSecurityProperties securityProperties = new WSSSecurityProperties();
+        securityProperties.loadSignatureVerificationKeystore(this.getClass().getClassLoader().getResource("receiver.jks"), "default".toCharArray());
+        securityProperties.loadDecryptionKeystore(this.getClass().getClassLoader().getResource("receiver.jks"), "default".toCharArray());
+        securityProperties.setCallbackHandler(new CallbackHandlerImpl());
+        // Return the underlying security error, so the tests can check why a message was rejected
+        InboundWSSec wsSecIn = WSSec.getInboundWSSec(securityProperties, false, true);
+        XMLStreamReader xmlStreamReader = wsSecIn.processInMessage(xmlInputFactory.createXMLStreamReader(new ByteArrayInputStream(message)));
+
+        return StAX2DOM.readDoc(documentBuilderFactory.newDocumentBuilder(), xmlStreamReader);
+    }
+
+    private static void assertCauseMessageContains(Throwable throwable, String expected) {
+        for (Throwable t = throwable; t != null; t = t.getCause()) {
+            if (t.getMessage() != null && t.getMessage().contains(expected)) {
+                return;
+            }
+        }
+        Assert.fail("No cause of " + throwable + " has a message containing: " + expected);
     }
 }

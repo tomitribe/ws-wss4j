@@ -21,7 +21,10 @@ package org.apache.wss4j.stax.test;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.Properties;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import javax.xml.stream.XMLStreamException;
 import javax.xml.stream.XMLStreamReader;
@@ -50,7 +53,9 @@ import org.w3c.dom.Document;
 import org.w3c.dom.NodeList;
 
 public class ReplayTest extends AbstractTestBase {
-    
+
+    private static final Pattern NONCE_PATTERN = Pattern.compile("(<[^>]*Nonce[^>]*>)([^<]*)(</)");
+
     private ReplayCache createCache(String key) throws WSSecurityException {
         ReplayCacheFactory replayCacheFactory = ReplayCacheFactory.newInstance();
         byte[] nonceValue;
@@ -169,8 +174,168 @@ public class ReplayTest extends AbstractTestBase {
                 Assert.assertTrue(e.getCause() instanceof XMLSecurityException);
             }
         }
-        
+
         replayCache.close();
+    }
+
+    /**
+     * The Nonce replay cache must be keyed on the decoded Nonce, not on the raw text of the Nonce
+     * element. Base64 decoding ignores whitespace, so a replayed token whose Nonce has merely been
+     * line-wrapped still authenticates - the password digest is computed over the decoded bytes -
+     * and must still be detected as a replay.
+     */
+    @Test
+    public void testReplayedUsernameTokenWithEquivalentNonceEncoding() throws Exception {
+        String genuineMessage = createUsernameTokenMessage();
+
+        Matcher matcher = NONCE_PATTERN.matcher(genuineMessage);
+        Assert.assertTrue("No Nonce element was found", matcher.find());
+        String nonce = matcher.group(2);
+
+        // Wrap the Nonce across two lines. Base64 decoding ignores the newline, so this Nonce
+        // decodes to exactly the same bytes and the password digest still verifies.
+        String equivalentNonce = nonce.substring(0, 4) + "\n" + nonce.substring(4);
+        Assert.assertNotEquals(nonce, equivalentNonce);
+        Assert.assertArrayEquals("The rewritten Nonce must decode to the same bytes",
+                                 org.apache.commons.codec.binary.Base64.decodeBase64(nonce),
+                                 org.apache.commons.codec.binary.Base64.decodeBase64(equivalentNonce));
+
+        String replayedMessage = genuineMessage.substring(0, matcher.start(2))
+            + equivalentNonce + genuineMessage.substring(matcher.end(2));
+
+        ReplayCache replayCache = createCache("wss4j.nonce.cache-");
+
+        //the genuine UsernameToken must verify
+        processUsernameTokenMessage(genuineMessage, replayCache);
+
+        //the rewritten Nonce decodes to the same bytes, so this is a replay
+        try {
+            processUsernameTokenMessage(replayedMessage, replayCache);
+            Assert.fail("Exception expected");
+        } catch (XMLStreamException e) {
+            Assert.assertTrue(e.getCause() instanceof XMLSecurityException);
+        }
+
+        replayCache.close();
+    }
+
+    /**
+     * The streaming UsernameToken validator decodes the Nonce with commons-codec, which also skips
+     * characters outside the Base-64 alphabet, accepts missing padding and ignores anything after
+     * the padding. Each of these rewrites still authenticates on its own, so each must be detected
+     * as a replay of the genuine token.
+     */
+    @Test
+    public void testReplayedUsernameTokenWithLenientlyDecodedNonce() throws Exception {
+        String genuineMessage = createUsernameTokenMessage();
+
+        Matcher matcher = NONCE_PATTERN.matcher(genuineMessage);
+        Assert.assertTrue("No Nonce element was found", matcher.find());
+        String nonce = matcher.group(2);
+        Assert.assertTrue("Expected a padded Nonce: " + nonce, nonce.endsWith("="));
+
+        String[] equivalentNonces = {
+            nonce.replace("=", ""),                           // missing padding
+            nonce.substring(0, 4) + "!" + nonce.substring(4), // character outside the alphabet
+            nonce + "QUFB",                                   // data after the padding
+        };
+
+        for (String equivalentNonce : equivalentNonces) {
+            Assert.assertArrayEquals("The rewritten Nonce must decode to the same bytes: " + equivalentNonce,
+                                     org.apache.commons.codec.binary.Base64.decodeBase64(nonce),
+                                     org.apache.commons.codec.binary.Base64.decodeBase64(equivalentNonce));
+            String replayedMessage = genuineMessage.substring(0, matcher.start(2))
+                + equivalentNonce + genuineMessage.substring(matcher.end(2));
+
+            //on its own, the rewritten token authenticates: its password digest still verifies
+            ReplayCache freshCache = createCache("wss4j.nonce.cache-");
+            processUsernameTokenMessage(replayedMessage, freshCache);
+            freshCache.close();
+
+            //after the genuine token, it is a replay
+            ReplayCache replayCache = createCache("wss4j.nonce.cache-");
+            processUsernameTokenMessage(genuineMessage, replayCache);
+            try {
+                processUsernameTokenMessage(replayedMessage, replayCache);
+                Assert.fail("Exception expected for the rewritten Nonce " + equivalentNonce);
+            } catch (XMLStreamException e) {
+                Assert.assertTrue(e.getCause() instanceof XMLSecurityException);
+            }
+            replayCache.close();
+        }
+    }
+
+    /**
+     * A UsernameToken whose password fails to verify must not leave its Nonce in the replay cache.
+     * Otherwise an attacker can replay a genuine token with a corrupted Password and send that
+     * first: it is rejected, but it has claimed the genuine token's Nonce, so the genuine token is
+     * then rejected as a replay when it arrives.
+     */
+    @Test
+    public void testNonceCacheNotPoisonedByInvalidPassword() throws Exception {
+        String genuineMessage = createUsernameTokenMessage();
+
+        // Corrupt the password digest, leaving the Nonce - the whole cache key - untouched
+        Matcher matcher =
+            Pattern.compile("(<[^>]*Password[^>]*>)([^<]*)(</)").matcher(genuineMessage);
+        Assert.assertTrue("No Password element was found", matcher.find());
+        String password = matcher.group(2);
+        String corruptedPassword =
+            (password.charAt(0) == 'A' ? "B" : "A") + password.substring(1);
+
+        String tamperedMessage = genuineMessage.substring(0, matcher.start(2))
+            + corruptedPassword + genuineMessage.substring(matcher.end(2));
+        Assert.assertNotEquals(genuineMessage, tamperedMessage);
+
+        ReplayCache replayCache = createCache("wss4j.nonce.cache-");
+
+        //the tampered token must be rejected, as its password digest no longer verifies
+        try {
+            processUsernameTokenMessage(tamperedMessage, replayCache);
+            Assert.fail("Exception expected");
+        } catch (XMLStreamException e) {
+            Assert.assertTrue(e.getCause() instanceof XMLSecurityException);
+        }
+
+        //...and it must not have cached the genuine token's Nonce on its way out
+        processUsernameTokenMessage(genuineMessage, replayCache);
+
+        //replay detection must still work for the genuine token itself
+        try {
+            processUsernameTokenMessage(genuineMessage, replayCache);
+            Assert.fail("Exception expected");
+        } catch (XMLStreamException e) {
+            Assert.assertTrue(e.getCause() instanceof XMLSecurityException);
+        }
+
+        replayCache.close();
+    }
+
+    private String createUsernameTokenMessage() throws Exception {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        InputStream sourceDocument = this.getClass().getClassLoader().getResourceAsStream("testdata/plain-soap-1.1.xml");
+        String action = WSHandlerConstants.USERNAME_TOKEN;
+        Properties properties = new Properties();
+        Document securedDocument = doOutboundSecurityWithWSS4J(sourceDocument, action, properties);
+
+        javax.xml.transform.Transformer transformer = TRANSFORMER_FACTORY.newTransformer();
+        transformer.transform(new DOMSource(securedDocument), new StreamResult(baos));
+        return new String(baos.toByteArray(), StandardCharsets.UTF_8);
+    }
+
+    private void processUsernameTokenMessage(String message, ReplayCache replayCache) throws Exception {
+        WSSSecurityProperties securityProperties = new WSSSecurityProperties();
+        securityProperties.setNonceReplayCache(replayCache);
+        securityProperties.setCallbackHandler(new CallbackHandlerImpl());
+        InboundWSSec wsSecIn = WSSec.getInboundWSSec(securityProperties);
+        XMLStreamReader xmlStreamReader = wsSecIn.processInMessage(
+                xmlInputFactory.createXMLStreamReader(
+                        new ByteArrayInputStream(message.getBytes(StandardCharsets.UTF_8))));
+
+        Document document = StAX2DOM.readDoc(documentBuilderFactory.newDocumentBuilder(), xmlStreamReader);
+        NodeList nodeList = document.getElementsByTagNameNS(WSSConstants.TAG_WSSE_USERNAME_TOKEN.getNamespaceURI(),
+                                                            WSSConstants.TAG_WSSE_USERNAME_TOKEN.getLocalPart());
+        Assert.assertEquals(nodeList.getLength(), 1);
     }
 
     /**
