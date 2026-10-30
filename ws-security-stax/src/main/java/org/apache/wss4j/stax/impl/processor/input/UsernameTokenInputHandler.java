@@ -78,10 +78,22 @@ public class UsernameTokenInputHandler extends AbstractInputSecurityHeaderHandle
         ReplayCache replayCache = wssSecurityProperties.getNonceReplayCache();
         final EncodedString encodedNonce =
                 XMLSecurityUtils.getQNameType(usernameTokenType.getAny(), WSSConstants.TAG_WSSE_NONCE);
+        String nonceIdentifier = null;
+        long nonceTTL = -1L;
         if (encodedNonce != null && replayCache != null) {
-            // Check for replay attacks
-            String nonce = encodedNonce.getValue();
-            if (replayCache.contains(nonce)) {
+            // Check for replay attacks. Key the cache on the canonical form of the Nonce (CVE-2026-92899):
+            // the digest is computed over the decoded bytes, so equivalent encodings must collide. Decode
+            // with commons-codec, as UsernameTokenValidatorImpl does for the digest: it skips characters
+            // outside the Base-64 alphabet, missing padding and anything after the padding.
+            try {
+                nonceIdentifier = org.apache.commons.codec.binary.Base64.encodeBase64String(
+                    org.apache.commons.codec.binary.Base64.decodeBase64(encodedNonce.getValue()));
+            } catch (IllegalArgumentException ex) {
+                throw new WSSecurityException(
+                    WSSecurityException.ErrorCode.INVALID_SECURITY, ex, "badUsernameToken",
+                    new Object[] {"The Nonce is not valid Base-64"});
+            }
+            if (replayCache.contains(nonceIdentifier)) {
                 throw new WSSecurityException(WSSecurityException.ErrorCode.FAILED_AUTHENTICATION);
             }
 
@@ -89,10 +101,8 @@ public class UsernameTokenInputHandler extends AbstractInputSecurityHeaderHandle
             // Otherwise, cache for the configured TTL of the UsernameToken Created time, as any
             // older token will just get rejected anyway
             int utTTL = wssSecurityProperties.getUtTTL();
-            if (createdDate == null || utTTL <= 0) {
-                replayCache.add(nonce);
-            } else {
-                replayCache.add(nonce, utTTL + 1L);
+            if (createdDate != null && utTTL > 0) {
+                nonceTTL = utTTL + 1L;
             }
         }
 
@@ -110,6 +120,15 @@ public class UsernameTokenInputHandler extends AbstractInputSecurityHeaderHandle
         }
         final UsernameSecurityToken usernameSecurityToken =
                 usernameTokenValidator.validate(usernameTokenType, tokenContext);
+
+        // Only cache the Nonce once the token has been validated (upstream #704).
+        if (nonceIdentifier != null) {
+            if (nonceTTL > 0) {
+                replayCache.add(nonceIdentifier, nonceTTL);
+            } else {
+                replayCache.add(nonceIdentifier);
+            }
+        }
 
         SecurityTokenProvider<InboundSecurityToken> securityTokenProvider =
                 new SecurityTokenProvider<InboundSecurityToken>() {
